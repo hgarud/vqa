@@ -333,52 +333,6 @@ class BARTDecoder(nn.Module):
         }
         return output
 
-    def forward(
-        self,
-        input_ids,
-        attention_mask: Optional[torch.Tensor] = None,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        past_key_values: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        use_cache: bool = None,
-        output_attentions: Optional[torch.Tensor] = None,
-        output_hidden_states: Optional[torch.Tensor] = None,
-        return_dict: bool = None,
-    ):
-        return self.model.forward(
-            input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            encoder_hidden_states=encoder_hidden_states,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-    @staticmethod
-    def resize_bart_abs_pos_emb(weight: torch.Tensor, max_length: int) -> torch.Tensor:
-        """
-        Resize position embeddings
-        Truncate if sequence length of MBart backbone is greater than given max_length,
-        else interpolate to max_length
-        """
-        if weight.shape[0] > max_length:
-            weight = weight[:max_length, ...]
-        else:
-            weight = (
-                F.interpolate(
-                    weight.permute(1, 0).unsqueeze(0),
-                    size=max_length,
-                    mode="linear",
-                    align_corners=False,
-                )
-                .squeeze(0)
-                .permute(1, 0)
-            )
-        return weight
-
 
 class NougatModel(PreTrainedModel):
     r"""
@@ -532,37 +486,3 @@ class NougatModel(PreTrainedModel):
             }
 
         return output
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        model_path: Union[str, bytes, os.PathLike],
-        *model_args,
-        **kwargs,
-    ):
-        r"""
-        Instantiate a pretrained nougat model from a pre-trained model configuration
-
-        Args:
-            model_path:
-                Name of a pretrained model name either registered in huggingface.co. or saved in local.
-        """
-        model = super(NougatModel, cls).from_pretrained(
-            model_path, *model_args, **kwargs
-        )
-
-        # truncate or interpolate position embeddings of decoder
-        max_length = kwargs.get("max_length", model.config.max_position_embeddings)
-        if (
-            max_length != model.config.max_position_embeddings
-        ):  # if max_length of trained model differs max_length you want to train
-            model.decoder.model.model.decoder.embed_positions.weight = torch.nn.Parameter(
-                model.decoder.resize_bart_abs_pos_emb(
-                    model.decoder.model.model.decoder.embed_positions.weight,
-                    max_length
-                    + 2,  # https://github.com/huggingface/transformers/blob/v4.11.3/src/transformers/models/mbart/modeling_mbart.py#L118-L119
-                )
-            )
-            model.config.max_position_embeddings = max_length
-
-        return model
