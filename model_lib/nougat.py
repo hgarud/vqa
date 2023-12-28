@@ -1,8 +1,10 @@
 """Nougat model file."""
 
+import logging
 import math
 import os
 from typing import List, Optional, Union
+from collections import defaultdict
 
 import albumentations as alb
 from albumentations.pytorch import ToTensorV2
@@ -15,10 +17,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.transforms.functional import resize, rotate
-
 from timm.models.swin_transformer import SwinTransformer
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from transformers import MBartConfig, MBartForCausalLM, PreTrainedTokenizerFast
+from transformers import (
+    MBartConfig,
+    MBartForCausalLM,
+    PreTrainedTokenizerFast,
+    StoppingCriteria,
+    StoppingCriteriaList
+)
+from transformers.file_utils import ModelOutput
+from transformers.modeling_utils import PreTrainedModel
+
+from vqa.config import NougatConfig
+from vqa.postprocessing import postprocess
 
 
 def alb_wrapper(transform):
@@ -35,6 +47,77 @@ test_transform = alb_wrapper(
         ]
     )
 )
+
+def batch(l, b=15):
+    subs = []
+    for i in range(len(l) - b):
+        subs.append(l[i : i + b])
+    return subs
+
+
+def subdiv(l, b=10):
+    subs = []
+    for i in range(len(l) - b):
+        subs.append(l[: i + b])
+    return subs
+
+class RunningVarTorch:
+    def __init__(self, L=15, norm=False):
+        self.values = None
+        self.L = L
+        self.norm = norm
+
+    def push(self, x: torch.Tensor):
+        assert x.dim() == 1
+        if self.values is None:
+            self.values = x[:, None]
+        elif self.values.shape[1] < self.L:
+            self.values = torch.cat((self.values, x[:, None]), 1)
+        else:
+            self.values = torch.cat((self.values[:, 1:], x[:, None]), 1)
+
+    def variance(self):
+        if self.values is None:
+            return
+        if self.norm:
+            return torch.var(self.values, 1) / self.values.shape[1]
+        else:
+            return torch.var(self.values, 1)
+
+
+class StoppingCriteriaScores(StoppingCriteria):
+    def __init__(self, threshold: float = 0.015, window_size: int = 200):
+        super().__init__()
+        self.threshold = threshold
+        self.vars = RunningVarTorch(norm=True)
+        self.varvars = RunningVarTorch(L=window_size)
+        self.stop_inds = defaultdict(int)
+        self.stopped = defaultdict(bool)
+        self.size = 0
+        self.window_size = window_size
+
+    @torch.no_grad()
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor):
+        last_scores = scores[-1]
+        self.vars.push(last_scores.max(1)[0].float().cpu())
+        self.varvars.push(self.vars.variance())
+        self.size += 1
+        if self.size < self.window_size:
+            return False
+
+        varvar = self.varvars.variance()
+        for b in range(len(last_scores)):
+            if varvar[b] < self.threshold:
+                if self.stop_inds[b] > 0 and not self.stopped[b]:
+                    self.stopped[b] = self.stop_inds[b] >= self.size
+                else:
+                    self.stop_inds[b] = int(
+                        min(max(self.size, 1) * 1.15 + 150 + self.window_size, 4095)
+                    )
+            else:
+                self.stop_inds[b] = 0
+                self.stopped[b] = False
+        return all(self.stopped.values()) and len(self.stopped) > 0
 
 
 class SwinEncoder(nn.Module):
@@ -295,3 +378,191 @@ class BARTDecoder(nn.Module):
                 .permute(1, 0)
             )
         return weight
+
+
+class NougatModel(PreTrainedModel):
+    r"""
+    Nougat: Neural Optical UnderstandinG for Academic documents.
+    The encoder converts an image of an academic document into a series of embeddings.
+    Then, the decoder generates a sequence of tokens based on encoder's output.
+    This sequence can be translated into a structured markup language format.
+    """
+    config_class = NougatConfig
+    base_model_prefix = "nougat"
+
+    def __init__(self, config: NougatConfig):
+        super().__init__(config)
+        self.config = config
+        self.encoder = SwinEncoder(
+            input_size=self.config.input_size,
+            align_long_axis=self.config.align_long_axis,
+            window_size=self.config.window_size,
+            encoder_layer=self.config.encoder_layer,
+            name_or_path=self.config.name_or_path,
+            patch_size=self.config.patch_size,
+            embed_dim=self.config.embed_dim,
+            num_heads=self.config.num_heads,
+        )
+        self.decoder = BARTDecoder(
+            max_position_embeddings=self.config.max_position_embeddings,
+            decoder_layer=self.config.decoder_layer,
+            name_or_path=self.config.name_or_path,
+            hidden_dimension=self.config.hidden_dimension,
+        )
+    
+    def inference(
+        self,
+        image: Image.Image = None,
+        image_tensors: Optional[torch.Tensor] = None,
+        return_attentions: bool = False,
+        early_stopping: bool = True,
+    ):
+        """
+        Generate a token sequence in an auto-regressive manner.
+
+        Args:
+            image: input document image (PIL.Image)
+            image_tensors: (1, num_channels, height, width)
+                convert prompt to tensor if image_tensor is not fed
+        """
+        output = {
+            "predictions": list(),
+            "sequences": list(),
+            "repeats": list(),
+            "repetitions": list(),
+        }
+        if image is None and image_tensors is None:
+            logging.warn("Image not found")
+            return output
+
+        if image_tensors is None:
+            image_tensors = self.encoder.prepare_input(image).unsqueeze(0)
+
+        if self.device.type != "mps":
+            image_tensors = image_tensors.to(next(self.parameters()).dtype)
+
+        image_tensors = image_tensors.to(self.device)
+
+        last_hidden_state = self.encoder(image_tensors)
+
+        encoder_outputs = ModelOutput(
+            last_hidden_state=last_hidden_state, attentions=None
+        )
+
+        if len(encoder_outputs.last_hidden_state.size()) == 1:
+            encoder_outputs.last_hidden_state = (
+                encoder_outputs.last_hidden_state.unsqueeze(0)
+            )
+
+        # get decoder output
+        decoder_output = self.decoder.model.generate(
+            encoder_outputs=encoder_outputs,
+            min_length=1,
+            max_length=self.config.max_length,
+            pad_token_id=self.decoder.tokenizer.pad_token_id,
+            eos_token_id=self.decoder.tokenizer.eos_token_id,
+            use_cache=True,
+            bad_words_ids=[
+                [self.decoder.tokenizer.unk_token_id],
+            ],
+            return_dict_in_generate=True,
+            output_scores=True,
+            output_attentions=return_attentions,
+            do_sample=False,
+            stopping_criteria=StoppingCriteriaList(
+                [StoppingCriteriaScores()] if early_stopping else []
+            ),
+        )
+        output["repetitions"] = decoder_output.sequences.clone()
+        output["sequences"] = decoder_output.sequences.clone()
+        batch_size = len(decoder_output.sequences)
+
+        logits = torch.stack(decoder_output.scores, 1).cpu().max(-1)
+        values = logits.values
+        indices = logits.indices
+
+        for b in range(batch_size):
+            mask = indices[b] != self.decoder.tokenizer.pad_token_id
+            N = mask.sum().item()
+            var = np.array(
+                [np.var(s) / len(s) for s in batch(values[b, mask].float().numpy())]
+            )
+            if len(var) < 10:
+                output["repeats"].append(None)
+                continue
+            varvar = np.array([np.var(v) for v in subdiv(var[::-1])][::-1])
+            minlen = 120
+            if (
+                indices[b] == self.decoder.tokenizer.eos_token_id
+            ).any() and N + 1 < indices.shape[1]:
+                # there is an end to the generation, likely no repetitions
+                output["repeats"].append(None)
+                continue
+            small_var = np.where(varvar < 0.045)[0]
+            if early_stopping and len(small_var) > 1:
+                if np.all(np.diff(small_var) < 2):
+                    idx = int(min(max(small_var[0], 1) * 1.08 + minlen, 4095))
+                    if idx / N > 0.9:  # at most last bit
+                        output["repeats"].append(None)
+                        continue
+                    elif small_var[0] < 30:
+                        idx = 0
+                    logging.warn("Found repetitions in sample %i" % b)
+                    output["repeats"].append(idx)
+                    output["sequences"][b, idx:] = self.decoder.tokenizer.pad_token_id
+                    output["repetitions"][b, :idx] = self.decoder.tokenizer.pad_token_id
+                else:
+                    output["repeats"].append(None)
+            else:
+                output["repeats"].append(None)
+        output["repetitions"] = self.decoder.tokenizer.batch_decode(
+            output["repetitions"], skip_special_tokens=True
+        )
+        output["predictions"] = postprocess(
+            self.decoder.tokenizer.batch_decode(
+                output["sequences"], skip_special_tokens=True
+            ),
+            markdown_fix=False,
+        )
+
+        if return_attentions:
+            output["attentions"] = {
+                "self_attentions": decoder_output.decoder_attentions,
+                "cross_attentions": decoder_output.cross_attentions,
+            }
+
+        return output
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_path: Union[str, bytes, os.PathLike],
+        *model_args,
+        **kwargs,
+    ):
+        r"""
+        Instantiate a pretrained nougat model from a pre-trained model configuration
+
+        Args:
+            model_path:
+                Name of a pretrained model name either registered in huggingface.co. or saved in local.
+        """
+        model = super(NougatModel, cls).from_pretrained(
+            model_path, *model_args, **kwargs
+        )
+
+        # truncate or interpolate position embeddings of decoder
+        max_length = kwargs.get("max_length", model.config.max_position_embeddings)
+        if (
+            max_length != model.config.max_position_embeddings
+        ):  # if max_length of trained model differs max_length you want to train
+            model.decoder.model.model.decoder.embed_positions.weight = torch.nn.Parameter(
+                model.decoder.resize_bart_abs_pos_emb(
+                    model.decoder.model.model.decoder.embed_positions.weight,
+                    max_length
+                    + 2,  # https://github.com/huggingface/transformers/blob/v4.11.3/src/transformers/models/mbart/modeling_mbart.py#L118-L119
+                )
+            )
+            model.config.max_position_embeddings = max_length
+
+        return model
