@@ -9,6 +9,7 @@ from typing import List, Union
 
 from pathlib import Path
 from vqa.model_lib.nougat import NougatModel
+from vqa.rasterize import rasterize_paper
 
 
 def download_papers(paper_ids: Union[str, List[str]], output_dir: Path) -> None:
@@ -17,14 +18,13 @@ def download_papers(paper_ids: Union[str, List[str]], output_dir: Path) -> None:
     if isinstance(paper_ids, str):
         paper_ids = [paper_ids]
 
-    logging.info("Downloading the papers...")
     base_url = "https://export.arxiv.org/pdf/"
     for pid in paper_ids:
         url = base_url + pid + ".pdf"
         r = requests.get(url, stream=True)
-        with open(os.path.join(output_dir, pid + ".pdf"), "wb") as f:
+        with open(os.path.join(output_dir, pid.replace(".", "_") + ".pdf"), "wb") as f:
             for chunk in r.iter_content(chunk_size=1024):
-                f.write(r.content)
+                f.write(chunk)
 
 
 def main(args):
@@ -35,8 +35,17 @@ def main(args):
     model = NougatModel.from_pretrained(args.checkpoint_dir)
 
     # Download the papers
+    logging.info("Downloading the papers...")
     pdf_dir = args.output_dir / "pdfs"
     download_papers(args.paper_id, pdf_dir)
+
+    # Extract text from the papers
+    logging.info("Extracting text from the papers...")
+    paper_paths = list(pdf_dir.rglob("*.pdf"))
+    for paper_path in paper_paths:
+        # rasterize the pdf into images
+        paper_pages = rasterize_paper(paper_path)
+
 
 
 if __name__ == '__main__':
