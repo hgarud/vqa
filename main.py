@@ -35,7 +35,8 @@ def main(args):
     model = NougatModel.from_pretrained(args.checkpoint_dir)
 
     # Download the papers
-    download_papers(args.paper_id, args.output_dir / "pdfs")
+    pdf_dir = args.output_dir / "pdfs"
+    download_papers(args.paper_id, pdf_dir)
 
 
 if __name__ == '__main__':
