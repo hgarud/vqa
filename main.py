@@ -13,6 +13,7 @@ from vqa.model_lib.nougat import NougatModel
 
 def download_papers(paper_ids: Union[str, List[str]], output_dir: Path) -> None:
     """Download papers from export.arxiv.org and save in a temporary folder."""
+    output_dir.mkdir(parents=True, exist_ok=True)
     if isinstance(paper_ids, str):
         paper_ids = [paper_ids]
 
@@ -34,14 +35,14 @@ def main(args):
     model = NougatModel.from_pretrained(args.checkpoint_dir)
 
     # Download the papers
-    download_papers(args.paper_id, args.output_dir)
+    download_papers(args.paper_id, args.output_dir / "pdfs")
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint_dir", "-c", type=Path, default="./checkpoint", help="Path to checkpoint directory.")
     parser.add_argument("--paper_id", "-pid", nargs='+', type=str, help="Paper ID(s) for inference.")
-    parser.add_argument("--output_dir", "-o", type=Path, default="./output/pdfs", help="Path to output directory.")
+    parser.add_argument("--output_dir", "-o", type=Path, default="./output", help="Path to output directory.")
 
     args = parser.parse_args()
 
