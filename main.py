@@ -13,6 +13,9 @@ from pathlib import Path
 from vqa.model_lib.nougat import NougatModel
 from vqa.rasterize import rasterize_paper
 
+from fastapi import FastAPI
+app = FastAPI()
+
 
 def download_papers(paper_ids: Union[str, List[str]], output_dir: Path) -> None:
     """Download papers from export.arxiv.org and save in a temporary folder."""
@@ -29,17 +32,20 @@ def download_papers(paper_ids: Union[str, List[str]], output_dir: Path) -> None:
                 f.write(chunk)
 
 
-def main(args):
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+@app.get("/nougat/{paper_id}")
+def main(paper_id: str) -> None:
+    checkpoint_dir = Path("./checkpoint")
+    output_dir = Path("./output")
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load the model
     logging.info("Loading the model...")
-    model = NougatModel.from_pretrained(args.checkpoint_dir)
+    model = NougatModel.from_pretrained(checkpoint_dir)
 
     # Download the papers
     logging.info("Downloading the papers...")
-    pdf_dir = args.output_dir / "pdfs"
-    download_papers(args.paper_id, pdf_dir)
+    pdf_dir = output_dir / "pdfs"
+    download_papers(paper_id, pdf_dir)
 
     # Extract text from the papers
     logging.info("Extracting text from the papers...")
@@ -77,7 +83,7 @@ def main(args):
                 predictions.append(output)
         out_text = "".join(predictions).strip()
         out_text = re.sub(r"\n{3,}", "\n\n", out_text).strip()
-        out_path = args.output_dir / "txts" / (paper_path.stem + ".txt")
+        out_path = output_dir / "txts" / (paper_path.stem + ".txt")
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(out_text)
 
